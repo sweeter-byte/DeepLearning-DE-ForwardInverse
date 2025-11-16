@@ -1,5 +1,6 @@
 """
 子任务3：Poisson方程参数k(x,y)识别反问题 - PINN求解器
+完整版训练脚本
 """
 
 import torch
@@ -20,7 +21,6 @@ np.random.seed(SEED)
 # 设备
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"使用设备: {DEVICE}")
-
 
 
 # 神经网络定义
@@ -49,11 +49,13 @@ class MLP(nn.Module):
 
 
 class PINN_Task3(nn.Module):
-    """双网络PINN"""
+    """双网络PINN：同时学习u(x,y)和k(x,y)"""
     def __init__(self, u_layers=[2, 64, 64, 64, 1], k_layers=[2, 32, 32, 32, 1]):
         super(PINN_Task3, self).__init__()
         
+        # 解场网络
         self.u_net = MLP(u_layers, activation=nn.Tanh())
+        # 参数场网络
         self.k_net = MLP(k_layers, activation=nn.Tanh())
         
         u_params = sum(p.numel() for p in self.u_net.parameters())
@@ -63,13 +65,16 @@ class PINN_Task3(nn.Module):
         print(f"总参数量: {u_params + k_params:,}")
     
     def forward_u(self, x, y):
+        """预测解u(x,y)"""
         xy = torch.stack([x, y], dim=-1)
         u = self.u_net(xy)
         return u.squeeze()
     
     def forward_k(self, x, y):
+        """预测参数k(x,y)，保证正值"""
         xy = torch.stack([x, y], dim=-1)
         k_raw = self.k_net(xy)
+        # 使用softplus保证k > 0
         k = nn.functional.softplus(k_raw.squeeze()) + 1e-6
         return k
 
@@ -88,13 +93,18 @@ def compute_source_term(x, y):
 
 
 def compute_pde_residual(model, x, y):
-    """计算PDE残差"""
+    """
+    计算PDE残差: -∇·(k∇u) - f
+    这是变系数Poisson方程
+    """
     x = x.requires_grad_(True)
     y = y.requires_grad_(True)
     
+    # 前向传播
     u = model.forward_u(x, y)
     k = model.forward_k(x, y)
     
+    # 计算u的梯度
     u_x = torch.autograd.grad(
         u, x, grad_outputs=torch.ones_like(u),
         create_graph=True, retain_graph=True)[0]
@@ -103,9 +113,11 @@ def compute_pde_residual(model, x, y):
         u, y, grad_outputs=torch.ones_like(u),
         create_graph=True, retain_graph=True)[0]
     
+    # 计算 k * ∇u
     ku_x = k * u_x
     ku_y = k * u_y
     
+    # 计算散度 ∇·(k∇u)
     div_ku_x = torch.autograd.grad(
         ku_x, x, grad_outputs=torch.ones_like(ku_x),
         create_graph=True, retain_graph=True)[0]
@@ -115,11 +127,14 @@ def compute_pde_residual(model, x, y):
         create_graph=True, retain_graph=True)[0]
     
     div_k_grad_u = div_ku_x + div_ku_y
+    
+    # 源项
     f = compute_source_term(x, y)
+    
+    # PDE残差
     residual = -div_k_grad_u - f
     
     return residual
-
 
 
 # 损失函数
@@ -127,7 +142,7 @@ def compute_loss(model, data_dict, weights):
     """计算总损失"""
     losses = {}
     
-    # 数据拟合
+    # 1. 数据拟合损失
     x_data = data_dict['x_data']
     y_data = data_dict['y_data']
     u_data = data_dict['u_data']
@@ -136,7 +151,7 @@ def compute_loss(model, data_dict, weights):
     L_data = torch.mean((u_pred - u_data)**2)
     losses['data'] = L_data.item()
     
-    # PDE残差
+    # 2. PDE残差损失
     x_col = data_dict['x_col']
     y_col = data_dict['y_col']
     
@@ -144,7 +159,7 @@ def compute_loss(model, data_dict, weights):
     L_pde = torch.mean(pde_residual**2)
     losses['pde'] = L_pde.item()
     
-    # 边界条件
+    # 3. 边界条件损失
     x_bc = data_dict['x_bc']
     y_bc = data_dict['y_bc']
     
@@ -152,12 +167,12 @@ def compute_loss(model, data_dict, weights):
     L_bc = torch.mean(u_bc**2)
     losses['bc'] = L_bc.item()
     
-    # k正则化
+    # 4. k正则化损失（偏向k≈1）
     k_data = model.forward_k(x_data, y_data)
     L_reg = torch.mean((k_data - 1.0)**2)
     losses['reg'] = L_reg.item()
     
-    # k光滑性
+    # 5. k光滑性损失
     x_smooth = x_data.clone().detach().requires_grad_(True)
     y_smooth = y_data.clone().detach().requires_grad_(True)
     k_smooth = model.forward_k(x_smooth, y_smooth)
@@ -194,17 +209,18 @@ def prepare_data(data_file, n_collocation=5000, n_boundary=400, device='cpu'):
     print("准备训练数据")
     print("="*70)
     
+    # 读取观测数据
     df = pd.read_excel(data_file)
     x_train = torch.tensor(df.iloc[:, 0].values, dtype=torch.float32, device=device)
     y_train = torch.tensor(df.iloc[:, 1].values, dtype=torch.float32, device=device)
     u_train = torch.tensor(df.iloc[:, 2].values, dtype=torch.float32, device=device)
     
-    print(f"\n训练数据: {len(x_train)} 个点")
+    print(f"\n观测数据: {len(x_train)} 个点")
     print(f"  x 范围: [{x_train.min():.4f}, {x_train.max():.4f}]")
     print(f"  y 范围: [{y_train.min():.4f}, {y_train.max():.4f}]")
     print(f"  u 范围: [{u_train.min():.4f}, {u_train.max():.4f}]")
     
-    # 配点
+    # 配点（用于计算PDE残差）
     x_col = torch.rand(n_collocation, device=device) * 2 - 1
     y_col = torch.rand(n_collocation, device=device) * 2 - 1
     print(f"\n配点 (PDE残差): {n_collocation} 个")
@@ -281,20 +297,26 @@ def train_model(model, data_dict, config, save_dir):
     for epoch in pbar:
         model.train()
         
-        optimizer.zero_grad()
+        # 前向传播 + 损失计算
         total_loss, losses = compute_loss(model, data_dict, weights)
-        total_loss.backward()
         
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # 反向传播
+        optimizer.zero_grad()
+        total_loss.backward()
         optimizer.step()
+        
+        # 更新学习率
         scheduler.step(total_loss)
         
+        # 更新进度条
         pbar.set_postfix({
-            'loss': f'{losses["total"]:.2e}',
-            'data': f'{losses["data"]:.2e}',
-            'pde': f'{losses["pde"]:.2e}'
+            'Loss': f'{losses["total"]:.2e}',
+            'Data': f'{losses["data"]:.2e}',
+            'PDE': f'{losses["pde"]:.2e}',
+            'LR': f'{optimizer.param_groups[0]["lr"]:.2e}'
         })
         
+        # 记录历史
         if epoch % config['log_interval'] == 0:
             history['epoch'].append(epoch)
             history['total_loss'].append(losses['total'])
@@ -305,7 +327,7 @@ def train_model(model, data_dict, config, save_dir):
             history['smooth_loss'].append(losses['smooth'])
             history['lr'].append(optimizer.param_groups[0]['lr'])
             
-            if epoch % (config['log_interval'] * 10) == 0:
+            if epoch % (config['log_interval'] * 10) == 0 and epoch > 0:
                 print(f"\n{'='*70}")
                 print(f"Epoch {epoch}/{config['epochs']}")
                 print(f"{'='*70}")
@@ -317,6 +339,7 @@ def train_model(model, data_dict, config, save_dir):
                 print(f"Smooth Loss: {losses['smooth']:.6e}")
                 print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6e}")
         
+        # 保存最佳模型
         if total_loss.item() < best_loss:
             best_loss = total_loss.item()
             best_epoch = epoch
@@ -329,6 +352,7 @@ def train_model(model, data_dict, config, save_dir):
                 'config': config
             }, save_dir / 'best_model.pth')
         
+        # 定期保存检查点
         if epoch % config['save_interval'] == 0 and epoch > 0:
             torch.save({
                 'epoch': epoch,
@@ -345,12 +369,12 @@ def train_model(model, data_dict, config, save_dir):
     print(f"总用时: {elapsed_time/60:.2f} 分钟")
     print(f"最佳损失: {best_loss:.6e} (Epoch {best_epoch})")
     
+    # 保存训练历史
     history_df = pd.DataFrame(history)
     history_df.to_csv(save_dir / 'training_history.csv', index=False)
     print(f"训练历史已保存: training_history.csv")
     
     return history
-
 
 
 # 评估
@@ -388,7 +412,7 @@ def evaluate_model(model, data_dict, save_dir):
         print(f"  均值: {k_mean:.4f}")
         print(f"  标准差: {k_std:.4f}")
     
-    # PDE残差
+    # PDE残差（需要梯度）
     model.train()
     pde_residual = compute_pde_residual(model, x_data, y_data)
     f_values = compute_source_term(x_data, y_data)
@@ -441,23 +465,17 @@ def generate_predictions(model, save_dir, device='cpu', grid_size=100):
     u_pred = u_pred.reshape(grid_size, grid_size)
     k_pred = k_pred.reshape(grid_size, grid_size)
     
-    predictions = {
-        'x': x.tolist(),
-        'y': y.tolist(),
-        'u_pred': u_pred.tolist(),
-        'k_pred': k_pred.tolist()
-    }
+    # 保存为npz（方便可视化脚本加载）
+    np.savez(save_dir / 'grid_predictions.npz',
+             x=x, y=y, u_pred=u_pred, k_pred=k_pred)
     
-    with open(save_dir / 'grid_predictions.json', 'w') as f:
-        json.dump(predictions, f)
+    print(f"网格预测已保存: grid_predictions.npz")
     
-    print(f"网格预测已保存: grid_predictions.json")
-    
-    return predictions
+    return {'x': x, 'y': y, 'u_pred': u_pred, 'k_pred': k_pred}
 
 
 def save_training_predictions(model, data_dict, save_dir):
-    """保存训练数据预测 - 修复版"""
+    """保存训练数据预测"""
     print("\n保存训练数据预测...")
     
     model.eval()
@@ -469,8 +487,6 @@ def save_training_predictions(model, data_dict, save_dir):
         
         u_pred = model.forward_u(data_dict['x_data'], data_dict['y_data']).cpu().numpy()
         k_pred = model.forward_k(data_dict['x_data'], data_dict['y_data']).cpu().numpy()
-        
-        # 修复: 在no_grad内计算f
         f = compute_source_term(data_dict['x_data'], data_dict['y_data']).cpu().numpy()
     
     df = pd.DataFrame({
@@ -485,7 +501,6 @@ def save_training_predictions(model, data_dict, save_dir):
     
     df.to_csv(save_dir / 'training_data_predictions.csv', index=False)
     print("训练数据预测已保存: training_data_predictions.csv")
-
 
 
 # 主函数
@@ -511,13 +526,13 @@ def main():
         'n_collocation': 5000,
         'n_boundary': 400,
         
-        # 损失权重 - 优化建议
+        # 损失权重
         'loss_weights': {
             'data': 1.0,       # 数据拟合
-            'pde': 0.1,        # 修改: 从0.01增加到0.1，加强物理约束
+            'pde': 0.1,        # PDE残差
             'bc': 0.1,         # 边界条件
-            'reg': 1e-4,       # 修改: 从1e-5增加到1e-4，防止k过大
-            'smooth': 1e-4     # 修改: 从1e-5增加到1e-4，增加光滑性
+            'reg': 1e-4,       # k正则化
+            'smooth': 1e-4     # k光滑性
         },
         
         'grid_size': 100
@@ -575,7 +590,7 @@ def main():
     print("\n生成的文件:")
     for file in sorted(save_dir.glob('*')):
         print(f"  - {file.name}")
-    print("\n下一步: 运行 python visualize.py 生成图表")
+    print("\n下一步: 运行 python task3_visualize.py 生成图表")
     print("="*70)
 
 
