@@ -19,7 +19,10 @@
 *.pdf
 
 # 结果文件
-results
+results/
+paper_figures/
+__pycache__
 
 # 测试文件
 *.xlsx
+*.csv
